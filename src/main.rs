@@ -1,26 +1,29 @@
 use anyhow::Context;
 use axum::{
-    Router,
+    Extension, Json, Router,
     body::Body,
     extract::DefaultBodyLimit,
-    http::{HeaderValue, Response, header},
+    http::{HeaderValue, Response, StatusCode, header},
+    response::IntoResponse,
     routing::post,
 };
 use axum_typed_multipart::{FieldData, TryFromMultipart, TypedMultipart};
 use bytes::Bytes;
 use clap::Parser;
-use error::DynHttpError;
 use rand::{Rng, distributions::Alphanumeric};
+use serde::Serialize;
 use std::{
     env::temp_dir,
     path::{Path, PathBuf, absolute},
+    sync::Arc,
 };
-use tokio::{process::Command, signal::ctrl_c};
+use tokio::{process::Command, signal::ctrl_c, try_join};
 use tracing::{debug, error};
 use tracing_subscriber::EnvFilter;
 
+use crate::encrypted::{FileCondition, get_file_condition};
+
 mod encrypted;
-mod error;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -28,6 +31,10 @@ struct Args {
     /// Path to the x2t installation (Omit to determine automatically)
     #[arg(long)]
     x2t_path: Option<String>,
+
+    /// Path to the converter fonts folder
+    #[arg(long)]
+    fonts_path: Option<String>,
 
     /// Port to bind the server to, defaults to 8080
     #[arg(long)]
@@ -61,20 +68,31 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let mut x2t_path: Option<PathBuf> = None;
+    let mut fonts_path: Option<PathBuf> = None;
 
-    // Try loading office path from command line
+    // Try loading paths from command line
     if let Some(path) = args.x2t_path {
         x2t_path = Some(PathBuf::from(&path));
     }
 
-    // Try loading x2t path from environment variables
+    if let Some(path) = args.fonts_path {
+        fonts_path = Some(PathBuf::from(&path));
+    }
+
+    // Try loading paths from environment variables
     if x2t_path.is_none()
         && let Ok(path) = std::env::var("X2T_PATH")
     {
         x2t_path = Some(PathBuf::from(&path));
     }
 
-    // Try determine default office path
+    if fonts_path.is_none()
+        && let Ok(path) = std::env::var("X2T_FONTS_PATH")
+    {
+        fonts_path = Some(PathBuf::from(&path));
+    }
+
+    // Try determine default path
     if x2t_path.is_none() {
         let default_path = Path::new("/var/www/onlyoffice/documentserver/server/FileConverter/bin");
 
@@ -83,16 +101,34 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if fonts_path.is_none() {
+        let default_path = Path::new("/var/www/onlyoffice/documentserver/fonts");
+        fonts_path = Some(default_path.to_path_buf());
+    }
+
     // Check a path was provided
-    let office_path = match x2t_path {
-        Some(value) => value,
+    let x2t_path = match x2t_path {
+        Some(value) => absolute(value).context("failed to make x2t path absolute")?,
         None => {
             error!("no x2t install path provided, cannot start server");
             panic!();
         }
     };
 
-    tracing::debug!("using x2t install from: {}", office_path.display());
+    let fonts_path = match fonts_path {
+        Some(value) => absolute(value).context("failed to make fonts path absolute")?,
+        None => {
+            error!("no fonts path provided, cannot start server");
+            panic!();
+        }
+    };
+
+    tracing::debug!("using x2t install from: {}", x2t_path.display());
+
+    let runtime_config = Arc::new(RuntimeConfig {
+        x2t_path,
+        fonts_path,
+    });
 
     // Determine the address to run the server on
     let server_address = if args.host.is_some() || args.port.is_some() {
@@ -107,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
     // Create the router
     let app = Router::new()
         .route("/convert", post(convert))
+        .layer(Extension(runtime_config))
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024));
 
     // Create a TCP listener
@@ -128,6 +165,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+struct RuntimeConfig {
+    x2t_path: PathBuf,
+    fonts_path: PathBuf,
+}
+
 /// Request to convert a file
 #[derive(TryFromMultipart)]
 struct UploadAssetRequest {
@@ -140,9 +182,11 @@ struct UploadAssetRequest {
 ///
 /// Converts the provided file to PDF format responding with the PDF file
 async fn convert(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
     TypedMultipart(UploadAssetRequest { file }): TypedMultipart<UploadAssetRequest>,
-) -> Result<Response<Body>, DynHttpError> {
+) -> Result<Response<Body>, ErrorResponse> {
     let bytes = file.contents;
+    let file_condition = get_file_condition(&bytes);
     let tmp_dir = temp_dir();
 
     // Generate random ID for the path name
@@ -157,7 +201,13 @@ async fn convert(
 
     // Delete the temp directory if it already exists
     if !tmp_dir.exists() {
-        std::fs::create_dir_all(&tmp_dir).context("failed to create temporary directory")?;
+        std::fs::create_dir_all(&tmp_dir).map_err(|err| {
+            tracing::error!(?err, "failed to create temporary directory");
+            ErrorResponse {
+                code: None,
+                message: "failed to create temporary directory".to_string(),
+            }
+        })?;
     }
 
     // Create input and output paths
@@ -165,11 +215,29 @@ async fn convert(
     let temp_in = tmp_dir.join(format!("tmp_native_input_{random_id}"));
     let temp_out = tmp_dir.join(format!("tmp_native_output_{random_id}.pdf"));
 
-    let config_abs_path = absolute(temp_config).context("failed to get config path")?;
-    let in_abs_path = absolute(temp_in).context("failed to get in path")?;
-    let out_abs_path = absolute(temp_out).context("failed to get out path")?;
+    let config_abs_path = absolute(temp_config).map_err(|err| {
+        tracing::error!(?err, "failed to make file path absolute (config)");
+        ErrorResponse {
+            code: None,
+            message: "failed to make file path absolute".to_string(),
+        }
+    })?;
 
-    let font_path = Path::new("/var/www/onlyoffice/documentserver/fonts");
+    let in_abs_path = absolute(temp_in).map_err(|err| {
+        tracing::error!(?err, "failed to make file path absolute (input)");
+        ErrorResponse {
+            code: None,
+            message: "failed to make file path absolute".to_string(),
+        }
+    })?;
+
+    let out_abs_path = absolute(temp_out).map_err(|err| {
+        tracing::error!(?err, "failed to make file path absolute (output)");
+        ErrorResponse {
+            code: None,
+            message: "failed to make file path absolute".to_string(),
+        }
+    })?;
 
     let config = format!(
         r#"
@@ -187,39 +255,82 @@ async fn convert(
         random_id,
         in_abs_path.display(),
         out_abs_path.display(),
-        font_path.display(),
+        runtime_config.fonts_path.display(),
     );
 
-    tokio::fs::write(&config_abs_path, config.as_bytes())
-        .await
-        .unwrap();
+    let write_config = tokio::fs::write(&config_abs_path, config.as_bytes());
+    let write_file = tokio::fs::write(in_abs_path, bytes.as_ref());
 
-    tokio::fs::write(in_abs_path, bytes.as_ref()).await.unwrap();
+    try_join!(write_config, write_file).map_err(|err| {
+        tracing::error!(?err, "failed to write files");
+        ErrorResponse {
+            code: None,
+            message: "failed to write files".to_string(),
+        }
+    })?;
 
     let ld_library_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    let ld_library_path = format!("{}:{}", runtime_config.x2t_path.display(), ld_library_path);
 
-    let output = Command::new("/var/www/onlyoffice/documentserver/server/FileConverter/bin/x2t")
+    let x2t = runtime_config.x2t_path.join("x2t");
+    let x2t = x2t.to_string_lossy();
+
+    let output = Command::new(x2t.as_ref())
         .arg(config_abs_path.display().to_string())
-        .env(
-            "LD_LIBRARY_PATH",
-            &format!(
-                "/var/www/onlyoffice/documentserver/server/FileConverter/bin/:{ld_library_path}"
-            ),
-        )
+        .env("LD_LIBRARY_PATH", &ld_library_path)
         .output()
         .await
-        .unwrap();
+        .map_err(|err| {
+            tracing::error!(?err, "failed to run x2t");
+            ErrorResponse {
+                code: None,
+                message: "failed to run x2t".to_string(),
+            }
+        })?;
 
     if !output.status.success() {
+        let error_code = output.status.code();
+        let message = error_code
+            .and_then(get_error_code_message)
+            .unwrap_or("unknown error occurred");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
         tracing::error!(
-            "{} {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "error processing file (stderr = {stderr}, exit code = {error_code:?}, file_condition = {file_condition:?})"
         );
-        return Err(anyhow::anyhow!("err").into());
+
+        // Assume encryption for out of range crashes
+        if stderr.contains("std::out_of_range") {
+            return Err(ErrorResponse {
+                code: error_code,
+                message: "file is encrypted".to_string(),
+            });
+        }
+
+        return Err(match file_condition {
+            FileCondition::LikelyCorrupted => ErrorResponse {
+                code: error_code,
+                message: "file is corrupted".to_string(),
+            },
+            FileCondition::LikelyEncrypted => ErrorResponse {
+                code: error_code,
+                message: "file is encrypted".to_string(),
+            },
+            _ => ErrorResponse {
+                code: error_code,
+                message: message.to_string(),
+            },
+        });
     }
 
-    let converted = tokio::fs::read(out_abs_path).await.unwrap();
+    let converted = tokio::fs::read(out_abs_path).await.map_err(|err| {
+        tracing::error!(?err, "failed to read output");
+        ErrorResponse {
+            code: None,
+            message: "failed to read output".to_string(),
+        }
+    })?;
 
     // Build the response
     let response = Response::builder()
@@ -228,12 +339,49 @@ async fn convert(
             HeaderValue::from_static("application/pdf"),
         )
         .body(Body::from(converted))
-        .context("failed to create response")?;
+        .map_err(|err| {
+            tracing::error!(?err, "failed to make response");
+            ErrorResponse {
+                code: None,
+                message: "failed to make response".to_string(),
+            }
+        })?;
 
     Ok(response)
 }
 
-const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "djvu", "doc", "docm", "docx", "dotx", "epub", "fb2", "html", "mhtml", "jpg", "odt", "ott",
-    "png", "rtf", "txt", "stw", "sxw", "wps", "wpt", "xml", "xps",
-];
+fn get_error_code_message(code: i32) -> Option<&'static str> {
+    Some(match code {
+        0x0001 => "AVS_FILEUTILS_ERROR_UNKNOWN",
+        0x0050 => "AVS_FILEUTILS_ERROR_CONVERT",
+        0x0051 => "AVS_FILEUTILS_ERROR_CONVERT_DOWNLOAD",
+        0x0052 => "AVS_FILEUTILS_ERROR_CONVERT_UNKNOWN_FORMAT",
+        0x0053 => "AVS_FILEUTILS_ERROR_CONVERT_TIMEOUT",
+        0x0054 => "AVS_FILEUTILS_ERROR_CONVERT_READ_FILE",
+        0x0055 => "AVS_FILEUTILS_ERROR_CONVERT_DRM_UNSUPPORTED",
+        0x0056 => "AVS_FILEUTILS_ERROR_CONVERT_CORRUPTED",
+        0x0057 => "AVS_FILEUTILS_ERROR_CONVERT_LIBREOFFICE",
+        0x0058 => "AVS_FILEUTILS_ERROR_CONVERT_PARAMS",
+        0x0059 => "AVS_FILEUTILS_ERROR_CONVERT_NEED_PARAMS",
+        0x005a => "AVS_FILEUTILS_ERROR_CONVERT_DRM",
+        0x005b => "AVS_FILEUTILS_ERROR_CONVERT_PASSWORD",
+        0x005c => "AVS_FILEUTILS_ERROR_CONVERT_ICU",
+        0x005d => "AVS_FILEUTILS_ERROR_CONVERT_LIMITS",
+        0x005e => "AVS_FILEUTILS_ERROR_CONVERT_ROWLIMITS",
+        0x005f => "AVS_FILEUTILS_ERROR_CONVERT_DETECT",
+        0x0060 => "AVS_FILEUTILS_ERROR_CONVERT_CELLLIMITS",
+        _ => return None,
+    })
+}
+
+#[derive(Serialize)]
+pub struct ErrorResponse {
+    pub code: Option<i32>,
+    pub message: String,
+}
+
+impl IntoResponse for ErrorResponse {
+    fn into_response(self) -> axum::response::Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(self)).into_response()
+    }
+}

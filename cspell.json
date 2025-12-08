@@ -3,6 +3,7 @@
     "dotenvy",
     "dotenv",
     "Jacobtread",
-    "onlyoffice"
+    "onlyoffice",
+    "documentserver"
   ]
 }
