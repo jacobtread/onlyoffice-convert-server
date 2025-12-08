@@ -186,7 +186,6 @@ async fn convert(
     TypedMultipart(UploadAssetRequest { file }): TypedMultipart<UploadAssetRequest>,
 ) -> Result<Response<Body>, ErrorResponse> {
     let bytes = file.contents;
-    let file_condition = get_file_condition(&bytes);
     let tmp_dir = temp_dir();
 
     // Generate random ID for the path name
@@ -258,8 +257,74 @@ async fn convert(
         runtime_config.fonts_path.display(),
     );
 
-    let write_config = tokio::fs::write(&config_abs_path, config.as_bytes());
-    let write_file = tokio::fs::write(in_abs_path, bytes.as_ref());
+    let result = x2t(
+        &in_abs_path,
+        &config_abs_path,
+        &out_abs_path,
+        &runtime_config.x2t_path,
+        &bytes,
+        config.as_bytes(),
+    )
+    .await;
+
+    // Spawn a cleanup task
+    tokio::spawn(async move {
+        if in_abs_path.exists()
+            && let Err(err) = tokio::fs::remove_file(in_abs_path).await
+        {
+            tracing::error!(?err, "failed to delete config file");
+        }
+
+        if config_abs_path.exists()
+            && let Err(err) = tokio::fs::remove_file(config_abs_path).await
+        {
+            tracing::error!(?err, "failed to delete config file");
+        }
+
+        if out_abs_path.exists()
+            && let Err(err) = tokio::fs::remove_file(out_abs_path).await
+        {
+            tracing::error!(?err, "failed to delete config file");
+        }
+    });
+
+    let converted = match result {
+        Ok(value) => value,
+        Err(err) => return Err(err),
+    };
+
+    // Build the response
+    let response = Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/pdf"),
+        )
+        .body(Body::from(converted))
+        .map_err(|err| {
+            tracing::error!(?err, "failed to make response");
+            ErrorResponse {
+                code: None,
+                message: "failed to make response".to_string(),
+            }
+        })?;
+
+    Ok(response)
+}
+
+async fn x2t(
+    input_path: &Path,
+    config_path: &Path,
+    output_path: &Path,
+    x2t_path: &Path,
+    input_bytes: &[u8],
+    config_bytes: &[u8],
+) -> Result<Vec<u8>, ErrorResponse> {
+    let file_condition = get_file_condition(input_bytes);
+    let write_file = tokio::fs::write(input_path, input_bytes);
+    let write_config = tokio::fs::write(config_path, config_bytes);
+
+    let x2t = x2t_path.join("x2t");
+    let x2t = x2t.to_string_lossy();
 
     try_join!(write_config, write_file).map_err(|err| {
         tracing::error!(?err, "failed to write files");
@@ -270,13 +335,10 @@ async fn convert(
     })?;
 
     let ld_library_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-    let ld_library_path = format!("{}:{}", runtime_config.x2t_path.display(), ld_library_path);
-
-    let x2t = runtime_config.x2t_path.join("x2t");
-    let x2t = x2t.to_string_lossy();
+    let ld_library_path = format!("{}:{}", x2t_path.display(), ld_library_path);
 
     let output = Command::new(x2t.as_ref())
-        .arg(config_abs_path.display().to_string())
+        .arg(config_path.display().to_string())
         .env("LD_LIBRARY_PATH", &ld_library_path)
         .output()
         .await
@@ -324,30 +386,13 @@ async fn convert(
         });
     }
 
-    let converted = tokio::fs::read(out_abs_path).await.map_err(|err| {
+    tokio::fs::read(output_path).await.map_err(|err| {
         tracing::error!(?err, "failed to read output");
         ErrorResponse {
             code: None,
             message: "failed to read output".to_string(),
         }
-    })?;
-
-    // Build the response
-    let response = Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/pdf"),
-        )
-        .body(Body::from(converted))
-        .map_err(|err| {
-            tracing::error!(?err, "failed to make response");
-            ErrorResponse {
-                code: None,
-                message: "failed to make response".to_string(),
-            }
-        })?;
-
-    Ok(response)
+    })
 }
 
 fn get_error_code_message(code: i32) -> Option<&'static str> {

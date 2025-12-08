@@ -1,5 +1,3 @@
-use bytes::Bytes;
-
 const ENCRYPTED_SIGNATURES: &[&[u8]] = &[
     b"EncryptedPackage",
     b"Microsoft_Container_",
@@ -21,7 +19,7 @@ pub enum FileCondition {
 
 /// Helper to check the condition of a file for better corruption and encryption error
 /// checking
-pub fn get_file_condition(data: &Bytes) -> FileCondition {
+pub fn get_file_condition(data: &[u8]) -> FileCondition {
     let size = data.len();
 
     // File is empty, probably corrupted
