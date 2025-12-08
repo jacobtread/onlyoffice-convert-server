@@ -1,0 +1,44 @@
+[package]
+name = "onlyoffice-convert-server"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/jacobtread/office-convert-server"
+authors = ["Jacobtread <jacobtread@gmail.com>"]
+readme = "README.md"
+description = "HTTP server for converting office file formats to PDFs"
+
+[workspace]
+members = [".", "./client"]
+
+[dependencies]
+# Cheap sharable byte array type
+bytes = "1"
+
+# Environment variables
+dotenvy = "0.15"
+
+# Random generation (For temp file names)
+rand = "0.8"
+
+# JSON serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP server
+axum = { version = "0.7", features = ["multipart"] }
+axum_typed_multipart = "0.11"
+
+# Async runtime
+tokio = { version = "1", features = ["rt", "signal", "full"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Basic logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Command line parsing
+clap = { version = "4.5", features = ["derive"] }
