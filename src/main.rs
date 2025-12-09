@@ -125,7 +125,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::debug!("using x2t install from: {}", x2t_path.display());
 
+    let temp_path = temp_dir();
+    let temp_path = temp_path.join("onlyoffice-convert-server");
+
     let runtime_config = Arc::new(RuntimeConfig {
+        temp_path,
         x2t_path,
         fonts_path,
     });
@@ -166,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 struct RuntimeConfig {
+    temp_path: PathBuf,
     x2t_path: PathBuf,
     fonts_path: PathBuf,
 }
@@ -208,19 +213,6 @@ fn create_convert_temp_paths(temp_dir: &Path) -> std::io::Result<ConvertTempPath
     })
 }
 
-/// Determine the temporary directory to use and ensure it exists
-async fn setup_temp_dir() -> std::io::Result<PathBuf> {
-    let temp_dir = temp_dir();
-    let temp_dir = temp_dir.join("onlyoffice-convert-server");
-
-    // Ensure the temporary directory exists
-    if !temp_dir.exists() {
-        tokio::fs::create_dir_all(&temp_dir).await?;
-    }
-
-    Ok(temp_dir)
-}
-
 /// POST /convert
 ///
 /// Converts the provided file to PDF format responding with the PDF file
@@ -228,21 +220,25 @@ async fn convert(
     Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
     TypedMultipart(UploadAssetRequest { file }): TypedMultipart<UploadAssetRequest>,
 ) -> Result<Response<Body>, ErrorResponse> {
-    // Setup temporary directory
-    let temp_dir = setup_temp_dir().await.map_err(|err| {
-        tracing::error!(?err, "failed to create temporary directory");
-        ErrorResponse {
-            code: None,
-            message: "failed to create temporary directory".to_string(),
-        }
-    })?;
+    // Ensure temporary path exists
+    if !runtime_config.temp_path.exists() {
+        tokio::fs::create_dir_all(&runtime_config.temp_path)
+            .await
+            .map_err(|err| {
+                tracing::error!(?err, "failed to create temporary directory");
+                ErrorResponse {
+                    code: None,
+                    message: "failed to create temporary directory".to_string(),
+                }
+            })?
+    }
 
     // Create temporary path
     let ConvertTempPaths {
         config_path,
         input_path,
         output_path,
-    } = create_convert_temp_paths(&temp_dir).map_err(|err| {
+    } = create_convert_temp_paths(&runtime_config.temp_path).map_err(|err| {
         tracing::error!(?err, "failed to setup temporary paths");
         ErrorResponse {
             code: None,
