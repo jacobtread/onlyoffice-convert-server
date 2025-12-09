@@ -311,6 +311,11 @@ async fn convert(
     Ok(response)
 }
 
+#[cfg(not(windows))]
+const X2T_BIN: &str = "x2t";
+#[cfg(windows)]
+const X2T_BIN: &str = "x2t.exe";
+
 async fn x2t(
     input_path: &Path,
     config_path: &Path,
@@ -323,7 +328,7 @@ async fn x2t(
     let write_file = tokio::fs::write(input_path, input_bytes);
     let write_config = tokio::fs::write(config_path, config_bytes);
 
-    let x2t = x2t_path.join("x2t");
+    let x2t = x2t_path.join(X2T_BIN);
     let x2t = x2t.to_string_lossy();
 
     try_join!(write_config, write_file).map_err(|err| {
