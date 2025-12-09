@@ -10,7 +10,6 @@ use axum::{
 use axum_typed_multipart::{FieldData, TryFromMultipart, TypedMultipart};
 use bytes::Bytes;
 use clap::Parser;
-use rand::{Rng, distributions::Alphanumeric};
 use serde::Serialize;
 use std::{
     env::temp_dir,
@@ -20,6 +19,7 @@ use std::{
 use tokio::{process::Command, signal::ctrl_c, try_join};
 use tracing::{debug, error};
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 use crate::encrypted::{FileCondition, get_file_condition};
 
@@ -178,6 +178,49 @@ struct UploadAssetRequest {
     file: FieldData<Bytes>,
 }
 
+struct ConvertTempPaths {
+    config_path: PathBuf,
+    input_path: PathBuf,
+    output_path: PathBuf,
+}
+
+fn create_convert_temp_paths(temp_dir: &Path) -> std::io::Result<ConvertTempPaths> {
+    // Generate random unique ID
+    let random_id = Uuid::new_v4().simple();
+
+    // Create paths in temp directory
+    let config_path = temp_dir.join(format!("tmp_native_config_{random_id}.xml"));
+    let input_path = temp_dir.join(format!("tmp_native_input_{random_id}"));
+    let output_path = temp_dir.join(format!("tmp_native_output_{random_id}.pdf"));
+
+    // Make paths absolute
+    let config_path = absolute(config_path)
+        .inspect_err(|err| tracing::error!(?err, "failed to make file path absolute (config)"))?;
+    let input_path = absolute(input_path)
+        .inspect_err(|err| tracing::error!(?err, "failed to make file path absolute (input)"))?;
+    let output_path = absolute(output_path)
+        .inspect_err(|err| tracing::error!(?err, "failed to make file path absolute (output)"))?;
+
+    Ok(ConvertTempPaths {
+        config_path,
+        input_path,
+        output_path,
+    })
+}
+
+/// Determine the temporary directory to use and ensure it exists
+async fn setup_temp_dir() -> std::io::Result<PathBuf> {
+    let temp_dir = temp_dir();
+    let temp_dir = temp_dir.join("onlyoffice-convert-server");
+
+    // Ensure the temporary directory exists
+    if !temp_dir.exists() {
+        tokio::fs::create_dir_all(&temp_dir).await?;
+    }
+
+    Ok(temp_dir)
+}
+
 /// POST /convert
 ///
 /// Converts the provided file to PDF format responding with the PDF file
@@ -185,56 +228,25 @@ async fn convert(
     Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
     TypedMultipart(UploadAssetRequest { file }): TypedMultipart<UploadAssetRequest>,
 ) -> Result<Response<Body>, ErrorResponse> {
-    let bytes = file.contents;
-    let tmp_dir = temp_dir();
-
-    // Generate random ID for the path name
-    let random_id = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(10)
-        .map(|value| value as char)
-        .collect::<String>();
-
-    // Use our own special temp directory
-    let tmp_dir = tmp_dir.join("onlyoffice-convert-server");
-
-    // Delete the temp directory if it already exists
-    if !tmp_dir.exists() {
-        std::fs::create_dir_all(&tmp_dir).map_err(|err| {
-            tracing::error!(?err, "failed to create temporary directory");
-            ErrorResponse {
-                code: None,
-                message: "failed to create temporary directory".to_string(),
-            }
-        })?;
-    }
-
-    // Create input and output paths
-    let temp_config = tmp_dir.join(format!("tmp_native_config_{random_id}.xml"));
-    let temp_in = tmp_dir.join(format!("tmp_native_input_{random_id}"));
-    let temp_out = tmp_dir.join(format!("tmp_native_output_{random_id}.pdf"));
-
-    let config_abs_path = absolute(temp_config).map_err(|err| {
-        tracing::error!(?err, "failed to make file path absolute (config)");
+    // Setup temporary directory
+    let temp_dir = setup_temp_dir().await.map_err(|err| {
+        tracing::error!(?err, "failed to create temporary directory");
         ErrorResponse {
             code: None,
-            message: "failed to make file path absolute".to_string(),
+            message: "failed to create temporary directory".to_string(),
         }
     })?;
 
-    let in_abs_path = absolute(temp_in).map_err(|err| {
-        tracing::error!(?err, "failed to make file path absolute (input)");
+    // Create temporary path
+    let ConvertTempPaths {
+        config_path,
+        input_path,
+        output_path,
+    } = create_convert_temp_paths(&temp_dir).map_err(|err| {
+        tracing::error!(?err, "failed to setup temporary paths");
         ErrorResponse {
             code: None,
-            message: "failed to make file path absolute".to_string(),
-        }
-    })?;
-
-    let out_abs_path = absolute(temp_out).map_err(|err| {
-        tracing::error!(?err, "failed to make file path absolute (output)");
-        ErrorResponse {
-            code: None,
-            message: "failed to make file path absolute".to_string(),
+            message: "failed to setup temporary paths".to_string(),
         }
     })?;
 
@@ -243,46 +255,43 @@ async fn convert(
         <?xml version="1.0" encoding="utf-8"?>
         <TaskQueueDataConvert xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
-          <m_sKey>{}</m_sKey>
           <m_sFileFrom>{}</m_sFileFrom>
           <m_sFileTo>{}</m_sFileTo>
           <m_sFontDir>{}</m_sFontDir>
           <m_nFormatTo>513</m_nFormatTo>
-          <m_bEmbeddedFonts>false</m_bEmbeddedFonts>
         </TaskQueueDataConvert>
         "#,
-        random_id,
-        in_abs_path.display(),
-        out_abs_path.display(),
+        input_path.display(),
+        output_path.display(),
         runtime_config.fonts_path.display(),
     );
 
     let result = x2t(
-        &in_abs_path,
-        &config_abs_path,
-        &out_abs_path,
+        &input_path,
+        &config_path,
+        &output_path,
         &runtime_config.x2t_path,
-        &bytes,
+        &file.contents,
         config.as_bytes(),
     )
     .await;
 
     // Spawn a cleanup task
     tokio::spawn(async move {
-        if in_abs_path.exists()
-            && let Err(err) = tokio::fs::remove_file(in_abs_path).await
+        if input_path.exists()
+            && let Err(err) = tokio::fs::remove_file(input_path).await
         {
             tracing::error!(?err, "failed to delete config file");
         }
 
-        if config_abs_path.exists()
-            && let Err(err) = tokio::fs::remove_file(config_abs_path).await
+        if config_path.exists()
+            && let Err(err) = tokio::fs::remove_file(config_path).await
         {
             tracing::error!(?err, "failed to delete config file");
         }
 
-        if out_abs_path.exists()
-            && let Err(err) = tokio::fs::remove_file(out_abs_path).await
+        if output_path.exists()
+            && let Err(err) = tokio::fs::remove_file(output_path).await
         {
             tracing::error!(?err, "failed to delete config file");
         }
@@ -339,6 +348,8 @@ async fn x2t(
         }
     })?;
 
+    // Update the library path to include the x2t bin directory, fixes a bug where some of the requires
+    // .so libraries aren't loaded when they need to be
     let ld_library_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
     let ld_library_path = format!("{}:{}", x2t_path.display(), ld_library_path);
 
@@ -391,6 +402,7 @@ async fn x2t(
         });
     }
 
+    // Read the output file back
     tokio::fs::read(output_path).await.map_err(|err| {
         tracing::error!(?err, "failed to read output");
         ErrorResponse {
@@ -400,6 +412,7 @@ async fn x2t(
     })
 }
 
+/// Translate a x2t error code to the common x2t error messages
 fn get_error_code_message(code: i32) -> Option<&'static str> {
     Some(match code {
         0x0001 => "AVS_FILEUTILS_ERROR_UNKNOWN",
