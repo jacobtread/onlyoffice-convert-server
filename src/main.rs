@@ -45,6 +45,9 @@ struct Args {
     host: Option<String>,
 }
 
+const DEFAULT_X2T_PATH: &str = "/var/www/onlyoffice/documentserver/server/FileConverter/bin";
+const DEFAULT_FONTS_PATH: &str = "/var/www/onlyoffice/documentserver/fonts";
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     _ = dotenvy::dotenv();
@@ -94,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Try determine default path
     if x2t_path.is_none() {
-        let default_path = Path::new("/var/www/onlyoffice/documentserver/server/FileConverter/bin");
+        let default_path = Path::new(DEFAULT_X2T_PATH);
 
         if default_path.is_dir() {
             x2t_path = Some(default_path.to_path_buf());
@@ -102,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if fonts_path.is_none() {
-        let default_path = Path::new("/var/www/onlyoffice/documentserver/fonts");
+        let default_path = Path::new(DEFAULT_FONTS_PATH);
         fonts_path = Some(default_path.to_path_buf());
     }
 
