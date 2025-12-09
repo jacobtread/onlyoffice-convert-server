@@ -16,9 +16,9 @@ jobs:
                     - os: ubuntu-latest
                       file: office-convert-server
                       file_name: Ubuntu Build
-                    # - os: windows-latest
-                    #   file: office-convert-server.exe
-                    #   file_name: Windows Build
+                    - os: windows-latest
+                      file: office-convert-server.exe
+                      file_name: Windows Build
         runs-on: ${{ matrix.os }}
 
         steps:
