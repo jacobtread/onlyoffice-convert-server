@@ -1,12 +1,12 @@
 [package]
-name = "office-convert-client"
-version = "0.5.0"
+name = "onlyoffice-convert-client"
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/jacobtread/office-convert-server"
+repository = "https://github.com/jacobtread/onlyoffice-convert-server"
 authors = ["Jacobtread <jacobtread@gmail.com>"]
 readme = "../README.md"
-description = "Client library for interacting with office-convert-server"
+description = "Client library for interacting with onlyoffice-convert-server"
 
 [dependencies]
 # Cheap bytes type

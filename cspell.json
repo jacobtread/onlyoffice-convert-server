@@ -4,6 +4,8 @@
     "dotenv",
     "Jacobtread",
     "onlyoffice",
-    "documentserver"
+    "documentserver",
+    "reqwest",
+    "thiserror"
   ]
 }
